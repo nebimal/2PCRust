@@ -243,7 +243,25 @@ fn run(opts: & tpcoptions::TPCOptions, running: Arc<AtomicBool>) {
 /// 3. Starts the client protocol
 ///
 fn run_client(opts: & tpcoptions::TPCOptions, running: Arc<AtomicBool>) {
-    // TODO
+    
+    /***************************************************
+     *   1. Connects to the coordinator to get tx/rx   *
+    ***************************************************/
+
+    let (tx, rx) = connect_to_coordinator(opts);
+
+    /**********************************
+     *   2. Constructs a new client   *
+    **********************************/
+
+    let client_id = format!("client_{}", opts.num);
+    let mut client = client::Client::new(client_id, running, tx, rx);
+
+    /*************************************
+     *   3. Starts the client protocol   *
+    *************************************/
+
+    client.protocol(opts.num_requests);
 }
 
 ///
@@ -260,7 +278,30 @@ fn run_participant(opts: & tpcoptions::TPCOptions, running: Arc<AtomicBool>) {
     let participant_id_str = format!("participant_{}", opts.num);
     let participant_log_path = format!("{}//{}.log", opts.log_path, participant_id_str);
 
-    // TODO
+    /***************************************************
+     *   1. Connects to the coordinator to get tx/rx   *
+    ***************************************************/
+
+    let (tx, rx) = connect_to_coordinator(&opts);
+
+    /***************************************
+     *   2. Constructs a new participant   *
+    ***************************************/
+
+    let mut participant = participant::Participant::new(participant_id_str,
+        participant_log_path,
+        running,
+        opts.send_success_probability,
+        opts.operation_success_probability,
+        tx,
+        rx);
+
+    /******************************************
+     *   3. Starts the participant protocol   *
+    ******************************************/
+
+    participant.protocol();
+
 }
 
 fn main() {

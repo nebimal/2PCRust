@@ -77,7 +77,9 @@ impl Participant {
         log_path: String,
         r: Arc<AtomicBool>,
         send_success_prob: f64,
-        operation_success_prob: f64) -> Participant {
+        operation_success_prob: f64,
+        tx: Sender<ProtocolMessage>,
+        rx: Receiver<ProtocolMessage>) -> Participant {
 
         Participant {
             id_str: id_str,

@@ -50,7 +50,9 @@ impl Client {
     ///       the protocol is still running to this constructor
     ///
     pub fn new(id_str: String,
-               running: Arc<AtomicBool>) -> Client {
+               running: Arc<AtomicBool>,
+               tx: Sender<ProtocolMessage>,
+               rx: Receiver<ProtocolMessage>) -> Client {
         Client {
             id_str: id_str,
             running: running,
