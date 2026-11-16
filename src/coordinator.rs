@@ -85,7 +85,9 @@ impl Coordinator {
     /// HINT: Keep track of any channels involved!
     /// HINT: You may need to change the signature of this function
     ///
-    pub fn participant_join(&mut self, name: &String) {
+    pub fn participant_join(&mut self, name: &String, 
+    tx: Sender<ProtocolMessage>,
+    rx: Receiver<ProtocolMessage>) {
         assert!(self.state == CoordinatorState::Quiescent);
 
         // TODO
@@ -98,7 +100,9 @@ impl Coordinator {
     /// HINT: Keep track of any channels involved!
     /// HINT: You may need to change the signature of this function
     ///
-    pub fn client_join(&mut self, name: &String) {
+    pub fn client_join(&mut self, name: &String, 
+    tx: Sender<ProtocolMessage>,
+    rx: Receiver<ProtocolMessage>) {
         assert!(self.state == CoordinatorState::Quiescent);
 
         // TODO

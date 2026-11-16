@@ -146,7 +146,90 @@ fn connect_to_coordinator(opts: &tpcoptions::TPCOptions) -> (Sender<ProtocolMess
 fn run(opts: & tpcoptions::TPCOptions, running: Arc<AtomicBool>) {
     let coord_log_path = format!("{}//{}", opts.log_path, "coordinator.log");
 
-    // TODO
+    /************************************
+     *   1. Creates a new coordinator   *
+    ************************************/
+
+    // Function in coordinator.rs handles this.
+    let mut coordinator = coordinator::Coordinator::new(coord_log_path, &running);
+
+    // Store child process handles, which allows the parent process manage 
+    // and keep track of a child process it created.
+    let mut children: Vec<Child> = Vec::new();
+
+    /****************************************************************************************************
+     *   2. Spawns and connects to new clients processes and then registers them with the coordinator   *
+    ****************************************************************************************************/
+    
+    // I'm guessing I would do a for loop for num of clients the user specifies.
+    for i in 0..opts.num_clients {
+        // Gets the struct clone.
+        let mut child_opts = opts.clone();
+
+        // Since we're spawning client processes, we need to make sure we change their mode to 'client', 
+        // so whenever the client process runs, it doesn't act as a coordinator.
+        child_opts.mode = "client".to_string();
+
+        // Assigns a unique Client's ID
+        child_opts.num = i;
+
+        // Spawns Client Processes
+        let (child, tx, rx) = spawn_child_and_connect(&mut child_opts);
+
+        // Give the client a unique name.
+        let client_id = format!("client_{}", i);
+
+        // Function in coordinator.rs which registers the client's communication channels.
+        coordinator.client_join(&client_id, tx, rx);
+
+        // Save the process handle for later.
+        children.push(child);
+    }
+
+    /********************************************************************************************************
+     *   3. Spawns and connects to new participant processes and then registers them with the coordinator   *
+    ********************************************************************************************************/
+    
+    // Same as step 2 but with participants.
+    for i in 0..opts.num_participants {
+        // Gets the struct clone.
+        let mut child_opts = opts.clone();
+
+        // Since we're spawning participant processes, we need to make sure we change their mode to 'participant', 
+        // so whenever the participant process runs, it doesn't act as a coordinator or client.
+        child_opts.mode = "participant".to_string();
+
+        // Assigns a unique Oarticipant's ID
+        child_opts.num = i;
+
+        // Spawns Participant Processes
+        let (child, tx, rx) = spawn_child_and_connect(&mut child_opts);
+
+        // Give the Participant a unique name.
+        let participant_id = format!("participant_{}", i);
+
+        // Function in coordinator.rs which registers the participant's communication channels.
+        coordinator.participant_join(&participant_id, tx, rx);
+
+        // Save the process handle for later.
+        children.push(child);
+    }
+
+    /******************************************
+     *   4. Starts the coordinator protocol   *
+    ******************************************/
+
+    // Function in coordinator.rs handles this.
+    coordinator.protocol();
+
+    /***************************************************
+     *   5. Wait until the children finish execution   *
+    ***************************************************/
+
+    // Waits for all the child processes to finish.
+    for mut child in children {
+        child.wait().expect("Failed to wait for child process");
+    }
 }
 
 ///
