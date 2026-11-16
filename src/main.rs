@@ -35,13 +35,49 @@ use message::ProtocolMessage;
 /// HINT: You can change the signature of the function if necessary
 ///
 fn spawn_child_and_connect(child_opts: &mut tpcoptions::TPCOptions) -> (Child, Sender<ProtocolMessage>, Receiver<ProtocolMessage>) {
+    
+    // Okay so what I know is that child_ops is a struct
+    // (input) -> (x, y, z) is the return of the function.
+
+    /*********************
+     *   1. Set up IPC   * 
+    *********************/
+
+    // Create a OneShotServer to connect the process to a server.
+    let (server, server_name) =
+        IpcOneShotServer::<(
+            Sender<ProtocolMessage>,
+            Receiver<ProtocolMessage>
+        )>::new()
+        .expect("Failed to create IPC one-shot server");
+    
+
+    // In the struct, it requires the path to the server.
+    child_opts.ipc_path = server_name;
+
+    /************************************************************ 
+     *   2. Spawn a child process using the child CLI options   *   
+    ************************************************************/
+
+    // This spawns a process called child, which has the argument as a vector.
     let child = Command::new(env::current_exe().unwrap())
         .args(child_opts.as_vec())
         .spawn()
         .expect("Failed to execute child process");
 
-    let (tx, rx) = channel().unwrap();
-    // TODO
+
+    /******************************************************************************************** 
+     *   3. Do any required communication to set up the parent / child communication channels   *   
+    ********************************************************************************************/
+    
+    // Since this is the server process, we accept and block until a client sends a message.
+     let (_rx, (tx, rx)) = server.accept()
+        .expect("Failed to accept child connection");
+
+
+    /**************************************************************************************** 
+     *   4. Return the child process handle and the communication channels for the parent   *   
+    ****************************************************************************************/
 
     (child, tx, rx)
 }
