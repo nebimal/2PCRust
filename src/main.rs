@@ -94,11 +94,39 @@ fn spawn_child_and_connect(child_opts: &mut tpcoptions::TPCOptions) -> (Child, S
 /// HINT: You can change the signature of the function if necessasry
 ///
 fn connect_to_coordinator(opts: &tpcoptions::TPCOptions) -> (Sender<ProtocolMessage>, Receiver<ProtocolMessage>) {
-    let (tx, rx) = channel().unwrap();
+    /****************************************
+     *   1. Connect to the parent via IPC   *
+    ****************************************/
 
-    // TODO
+    // Create 2 channels 
+    // Coordinator sends; child receives.
+    let (parent_tx, child_rx) = channel::<ProtocolMessage>().unwrap();
 
-    (tx, rx)
+    // Child sends; coordinator receives.
+    let (child_tx, parent_rx) = channel::<ProtocolMessage>().unwrap();
+
+    let bootstrap_tx = Sender::<(
+    Sender<ProtocolMessage>,
+    Receiver<ProtocolMessage>
+    )>::connect(opts.ipc_path.clone())
+    .expect("Failed to connect to coordinator");
+
+    /********************************************************************************************
+     *   2. Do any required communication to set up the parent / child communication channels   *
+    ********************************************************************************************/
+    
+    // Sends the endpoints for the coordinator.
+    // parent_tx: Allows the coordinator to send messages to the child.
+    // parent_rx: Allows the coordinator to receive messages from the child.
+    bootstrap_tx.send((parent_tx, parent_rx))
+    .expect("Failed to send IPC endpoints");
+
+    /**********************************************************
+     *   3. Return the communication channels for the child   *
+    **********************************************************/
+
+    // Returns the endpoints that belong to the child.
+    (child_tx, child_rx)
 }
 
 ///
