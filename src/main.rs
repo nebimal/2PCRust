@@ -220,7 +220,8 @@ fn run(opts: & tpcoptions::TPCOptions, running: Arc<AtomicBool>) {
     ******************************************/
 
     // Function in coordinator.rs handles this.
-    coordinator.protocol();
+    let total_requests = opts.num_clients * opts.num_requests;
+    coordinator.protocol(total_requests);
 
     /***************************************************
      *   5. Wait until the children finish execution   *

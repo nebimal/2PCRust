@@ -48,6 +48,15 @@ pub struct Participant {
     running: Arc<AtomicBool>,
     send_success_prob: f64,
     operation_success_prob: f64,
+
+    // Communication with coordinator.
+    tx: Sender<ProtocolMessage>,
+    rx: Receiver<ProtocolMessage>,
+
+    // Transaction statistics.
+    successful_ops: u64,
+    failed_ops: u64,
+    unknown_ops: u64,
 }
 
 ///
@@ -88,7 +97,13 @@ impl Participant {
             running: r,
             send_success_prob: send_success_prob,
             operation_success_prob: operation_success_prob,
-            // TODO
+            
+            tx,
+            rx,
+
+            successful_ops: 0,
+            failed_ops: 0,
+            unknown_ops: 0,
         }
     }
 
@@ -102,10 +117,14 @@ impl Participant {
     ///
     pub fn send(&mut self, pm: ProtocolMessage) {
         let x: f64 = random();
-        if x <= self.send_success_prob {
-            // TODO: Send success
+        if x < self.send_success_prob {
+            // Attempt to send the message.
+            if let Err(error) = self.tx.send(pm) {
+                eprintln!("Participant send failed: {:?}", error);
+            }
         } else {
-            // TODO: Send fail
+            // Simulate dropping the message.
+            trace!("{}::Simulated message loss", self.id_str);
         }
     }
 
@@ -125,13 +144,13 @@ impl Participant {
 
         trace!("{}::Performing operation", self.id_str.clone());
         let x: f64 = random();
-        if x <= self.operation_success_prob {
-            // TODO: Successful operation
+        if x < self.operation_success_prob {
+            // Successful operation
+            true
         } else {
-            // TODO: Failed operation
+            // Failed operation
+            false
         }
-
-        true
     }
 
     ///
@@ -140,25 +159,9 @@ impl Participant {
     /// requests made by this coordinator before exiting.
     ///
     pub fn report_status(&mut self) {
-        // TODO: Collect actual stats
-        let successful_ops: u64 = 0;
-        let failed_ops: u64 = 0;
-        let unknown_ops: u64 = 0;
-
-        println!("{:16}:\tCommitted: {:6}\tAborted: {:6}\tUnknown: {:6}", self.id_str.clone(), successful_ops, failed_ops, unknown_ops);
+        println!("{:16}:\tCommitted: {:6}\tAborted: {:6}\tUnknown: {:6}", self.id_str.clone(), self.successful_ops, self.failed_ops, self.unknown_ops);
     }
 
-    ///
-    /// wait_for_exit_signal(&mut self)
-    /// Wait until the running flag is set by the CTRL-C handler
-    ///
-    pub fn wait_for_exit_signal(&mut self) {
-        trace!("{}::Waiting for exit signal", self.id_str.clone());
-
-        // TODO
-
-        trace!("{}::Exiting", self.id_str.clone());
-    }
 
     ///
     /// protocol()
@@ -166,12 +169,134 @@ impl Participant {
     /// HINT: If the simulation ends early, don't keep handling requests!
     /// HINT: Wait for some kind of exit signal before returning from the protocol!
     ///
+
     pub fn protocol(&mut self) {
-        trace!("{}::Beginning protocol", self.id_str.clone());
+        trace!("{}::Beginning protocol", self.id_str);
 
-        // TODO
+        // Track which transaction is awaiting a global decision.
+        let mut current_txid: Option<String> = None;
 
-        self.wait_for_exit_signal();
+        while self.running.load(Ordering::SeqCst) {
+
+            match self.rx.try_recv() {
+                Ok(message) => {
+
+                    match message.mtype {
+
+                        // STEP 1: Receive a proposal.
+                        MessageType::CoordinatorPropose => {
+
+                            // Coordinator handles one transaction at a time.
+                            if current_txid.is_some() {
+                                eprintln!("Already awaiting a decision");
+                                continue;
+                            }
+
+                            self.state = ParticipantState::ReceivedP1;
+
+                            // STEP 2: Simulate operation success/failure.
+                            let success =
+                                self.perform_operation(&Some(message.clone()));
+
+                            // STEP 3: Decide which vote to send.
+                            let vote_type = if success {
+                                self.state = ParticipantState::VotedCommit;
+                                MessageType::ParticipantVoteCommit
+                            } else {
+                                self.state = ParticipantState::VotedAbort;
+                                MessageType::ParticipantVoteAbort
+                            };
+
+                            // STEP 4: Record the vote locally.
+                            self.log.append(
+                                vote_type.clone(),
+                                message.txid.clone(),
+                                self.id_str.clone(),
+                                message.opid,
+                            );
+
+                            // STEP 5: Construct and send the vote.
+                            let vote = ProtocolMessage::generate(
+                                vote_type,
+                                message.txid.clone(),
+                                self.id_str.clone(),
+                                message.opid,
+                            );
+
+                            current_txid = Some(message.txid);
+                            self.send(vote);
+
+                            self.state = ParticipantState::AwaitingGlobalDecision;
+                        }
+
+                        // STEP 6: Receive global COMMIT.
+                        MessageType::CoordinatorCommit => {
+                            if current_txid.as_deref()
+                                != Some(message.txid.as_str())
+                            {
+                                continue;
+                            }
+
+                            self.log.append(
+                                MessageType::CoordinatorCommit,
+                                message.txid,
+                                self.id_str.clone(),
+                                message.opid,
+                            );
+
+                            self.successful_ops += 1;
+                            current_txid = None;
+                            self.state = ParticipantState::Quiescent;
+                        }
+
+                        // STEP 7: Receive global ABORT.
+                        MessageType::CoordinatorAbort => {
+                            if current_txid.as_deref()
+                                != Some(message.txid.as_str())
+                            {
+                                continue;
+                            }
+
+                            self.log.append(
+                                MessageType::CoordinatorAbort,
+                                message.txid,
+                                self.id_str.clone(),
+                                message.opid,
+                            );
+
+                            self.failed_ops += 1;
+                            current_txid = None;
+                            self.state = ParticipantState::Quiescent;
+                        }
+
+                        // STEP 8: Exit when coordinator requests shutdown.
+                        MessageType::CoordinatorExit => {
+                            break;
+                        }
+
+                        _ => {
+                            // Ignore unexpected message types.
+                        }
+                    }
+                }
+
+                Err(TryRecvError::Empty) => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+
+                Err(error) => {
+                    eprintln!("Participant receive error: {:?}", error);
+                    break;
+                }
+            }
+        }
+
+        // A proposed transaction never received its global decision.
+        if current_txid.is_some() {
+            self.unknown_ops += 1;
+        }
+
         self.report_status();
     }
+
 }

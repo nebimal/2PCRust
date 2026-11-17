@@ -189,7 +189,7 @@ impl Coordinator {
        report the final statistics.
     */
 
-    pub fn protocol(&mut self) {
+    pub fn protocol(&mut self, total_requests: u32) {
 
         // Alright so for this, I would need to use try_recv because if I use recv,
         // it will block while using a try_recv will always return a value without blocking.
@@ -199,8 +199,6 @@ impl Coordinator {
 
         // Keep running until all transactions are completed
         // or the simulation is stopped.
-        let opts = tpcoptions::TPCOptions::new();
-        let total_requests = opts.num_clients * opts.num_requests;
         let mut completed_requests: u32 = 0;
         while self.running.load(Ordering::SeqCst) && completed_requests < total_requests {
 
@@ -239,7 +237,7 @@ impl Coordinator {
                 continue;
             }
 
-            let mut status = RequestStatus::Unknown;
+            // let mut status = RequestStatus::Unknown;
             // Since a request exists, retrieve the request and the client who requested it.
             let (client_id, request) = pending_request.unwrap();
 
@@ -349,18 +347,18 @@ impl Coordinator {
             match decision {
                 MessageType::CoordinatorCommit => {
                     self.state = CoordinatorState::ReceivedVotesCommit;
-                    status = RequestStatus::Committed;
+                    // status = RequestStatus::Committed;
                     self.successful_ops += 1;
                 }
 
                 MessageType::CoordinatorAbort => {
                     self.state = CoordinatorState::ReceivedVotesAbort;
-                    status = RequestStatus::Aborted;
+                    // status = RequestStatus::Aborted;
                     self.failed_ops += 1;
                 }
 
                 _ => {
-                    status = RequestStatus::Unknown;
+                    // status = RequestStatus::Unknown;
                     self.unknown_ops += 1;
                     unreachable!();
                 }
