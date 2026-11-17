@@ -7,12 +7,12 @@ extern crate stderrlog;
 extern crate rand;
 extern crate ipc_channel;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use coordinator::ipc_channel::ipc::IpcSender as Sender;
 use coordinator::ipc_channel::ipc::IpcReceiver as Receiver;
@@ -24,6 +24,7 @@ use message::MessageType;
 use message::ProtocolMessage;
 use message::RequestStatus;
 use oplog;
+use tpcoptions;
 
 /// CoordinatorState
 /// States for 2PC state machine
@@ -196,6 +197,7 @@ impl Coordinator {
         // or the simulation is stopped.
         let opts = tpcoptions::TPCOptions::new();
         let total_requests = opts.num_clients * opts.num_requests;
+        let mut completed_requests: u32 = 0;
         while self.running.load(Ordering::SeqCst) && completed_requests < total_requests {
 
             /************************************************************************
@@ -209,16 +211,12 @@ impl Coordinator {
 
                 match client_recv.try_recv() {
                     Ok(request) => {
-                        println!(
-                            "Received request {} from {}",
-                            request.txid,
-                            client_id
-                        );
+                        if matches!(request.mtype, MessageType::ClientRequest) {
+                            pending_request = Some((client_id.clone(), request));
 
-                        pending_request = Some((client_id.clone(), request));
-
-                        // Exit for loop since we received a request.
-                        break;
+                            // Exit for loop since we received a request.
+                            break;
+                        }
                     }
 
                     Err(TryRecvError::Empty) => {
@@ -237,8 +235,12 @@ impl Coordinator {
                 continue;
             }
 
+            let mut status = RequestStatus::Unknown;
             // Since a request exists, retrieve the request and the client who requested it.
             let (client_id, request) = pending_request.unwrap();
+
+            // Set the state of the coordinator to ReceivedRequiest since we received a request.
+            self.state = CoordinatorState::ReceivedRequest;
 
             /**************************************************************************************************
              *   2. Once a ClientRequest is received, send a CoordinatorPropose message to ALL participants   *
@@ -256,43 +258,112 @@ impl Coordinator {
             for (_participant_id, participant_send) in &self.participant_senders {
                 participant_send.send(proposal.clone()).unwrap();
             }
+            self.state = CoordinatorState::ProposalSent;
 
             /********************************************************************************************** 
              *   3. Wait for participants to respond with ParticipantVoteCommit or ParticipantVoteAbort   * 
              *   Remember to handle timeouts.                                                             *
             **********************************************************************************************/
+            // Give the entire voting phase one second.
+            let deadline = Instant::now() + Duration::from_millis(1000);
 
-            // STEP 3 IS NOT FINISH, DO THIS!!!!!!!!!!!!!!!! 
+            // Track which participants voted commit for this transaction.
+            let mut commit_voters: HashSet<String> = HashSet::new();    
             
-            for (_participant_id, participant_recv) in &self.participant_receivers {
-                
-                match participant_recv.try_recv() {
-                    Ok(voteResult) => {
-                        // Voting results
-                        println!(
-                            "Received {} from {}",
-                            voteResult.txid,
-                            participant_id
-                        );
+            // Assume commit is possible until an abort or failure occurs.
+            let mut decision = MessageType::CoordinatorCommit;
 
-                        pending_request = Some((client_id.clone(), request));
+            while self.running.load(Ordering::SeqCst)
+                && Instant::now() < deadline
+                && commit_voters.len() < self.participant_receivers.len()
+            {
+                for (participant_id, participant_recv) in &self.participant_receivers {
 
-                        // Exit for loop since we received a request.
-                        break;
+                    // Already received this participant's vote.
+                    if commit_voters.contains(participant_id) {
+                        continue;
                     }
 
-                    Err(TryRecvError::Empty) => {
-                        // Nothing received from this client.
-                    }
+                    match participant_recv.try_recv() {
+                        Ok(vote_result) => {
 
-                    Err(error) => {
-                        eprintln!("Error: {:?}", error);
+                            // Make sure this vote belongs to our transaction.
+                            if vote_result.txid != request.txid {
+                                continue;
+                            }
+
+                            match vote_result.mtype {
+                                MessageType::ParticipantVoteCommit => {
+                                    commit_voters.insert(participant_id.clone());
+                                }
+
+                                MessageType::ParticipantVoteAbort => {
+                                    decision = MessageType::CoordinatorAbort;
+                                    break;
+                                }
+
+                                _ => {
+                                    // Unexpected message.
+                                }
+                            }
+                        }
+
+                        Err(TryRecvError::Empty) => {
+                            // No vote available yet.
+                        }
+
+                        Err(error) => {
+                            eprintln!("Receive error: {:?}", error);
+                            decision = MessageType::CoordinatorAbort;
+                            break;
+                        }
                     }
                 }
+
+                // Stop collecting votes after an abort.
+                if matches!(decision, MessageType::CoordinatorAbort) {
+                    break;
+                }
+
+                thread::sleep(Duration::from_millis(10));
+            }
+                
+            /*************************************************************      
+             *   4. Check the votes:                                     *
+             *     - If ALL participants vote commit, decide to COMMIT   *
+             *     - If ANY participant votes abort, decide to ABORT     *
+             *     - If any required vote is missing after the timeout   *
+             *       decide to ABORT.                                    *
+            *************************************************************/
+
+            // If any required commit vote is missing, abort.
+            if !self.running.load(Ordering::SeqCst) || commit_voters.len() != self.participant_receivers.len() {
+                decision = MessageType::CoordinatorAbort;
             }
 
+            // Update the coordinator's state.
+            match decision {
+                MessageType::CoordinatorCommit => {
+                    self.state = CoordinatorState::ReceivedVotesCommit;
+                    status = RequestStatus::Committed;
+                }
 
+                MessageType::CoordinatorAbort => {
+                    self.state = CoordinatorState::ReceivedVotesAbort;
+                    status = RequestStatus::Aborted;
+                }
 
+                _ => unreachable!(),
+            }
+            /**************************************************************
+             *   5. Record the global decision in the coordinator's log   *
+            **************************************************************/
+            self.log.append(
+                decision.clone(),
+                request.txid.clone(),
+                "coordinator".to_string(),
+                request.opid,
+            );
 
         }
 
