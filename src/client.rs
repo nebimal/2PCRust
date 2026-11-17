@@ -27,6 +27,15 @@ pub struct Client {
     pub id_str: String,
     pub running: Arc<AtomicBool>,
     pub num_requests: u32,
+
+    // Communication with coordinator.
+    tx: Sender<ProtocolMessage>,
+    rx: Receiver<ProtocolMessage>,
+
+    // Transaction statistics.
+    successful_ops: u64,
+    failed_ops: u64,
+    unknown_ops: u64,
 }
 
 ///
@@ -58,7 +67,13 @@ impl Client {
             id_str: id_str,
             running: running,
             num_requests: 0,
-            // TODO
+            
+            tx,
+            rx,
+
+            successful_ops: 0,
+            failed_ops: 0,
+            unknown_ops: 0,
         }
     }
 
@@ -69,8 +84,25 @@ impl Client {
     pub fn wait_for_exit_signal(&mut self) {
         trace!("{}::Waiting for exit signal", self.id_str.clone());
 
-        // TODO
+        while self.running.load(Ordering::SeqCst) {
+            match self.rx.try_recv() {
 
+                Ok(message) => {
+                    if matches!(message.mtype, MessageType::CoordinatorExit) {
+                        break;
+                    }
+                }
+
+                Err(TryRecvError::Empty) => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+
+                Err(error) => {
+                    eprintln!("Exit signal receive error: {:?}", error);
+                    break;
+                }
+            }
+        }
         trace!("{}::Exiting", self.id_str.clone());
     }
 
@@ -78,7 +110,7 @@ impl Client {
     /// send_next_operation(&mut self)
     /// Send the next operation to the coordinator
     ///
-    pub fn send_next_operation(&mut self) {
+    pub fn send_next_operation(&mut self) -> bool {
 
         // Create a new request with a unique TXID.
         self.num_requests = self.num_requests + 1;
@@ -89,9 +121,19 @@ impl Client {
                                                     self.num_requests);
         info!("{}::Sending operation #{}", self.id_str.clone(), self.num_requests);
 
-        // TODO
+        match self.tx.send(pm) {
+            Ok(()) => {
+                trace!("{}::Sent operation #{}", self.id_str, self.num_requests);
+                true
+            }
 
-        trace!("{}::Sent operation #{}", self.id_str.clone(), self.num_requests);
+            Err(error) => {
+                eprintln!("Failed to send client request: {:?}", error);
+                self.unknown_ops += 1;
+                false
+            }
+        }
+
     }
 
     ///
@@ -100,11 +142,63 @@ impl Client {
     /// last issued request. Note that we assume the coordinator does
     /// not fail in this simulation
     ///
-    pub fn recv_result(&mut self) {
+    pub fn recv_result(&mut self) -> bool {
 
         info!("{}::Receiving Coordinator Result", self.id_str.clone());
 
-        // TODO
+        // The transaction ID of our most recent request.
+        let expected_txid = format!(
+            "{}_op_{}",
+            self.id_str,
+            self.num_requests
+        );
+
+        while self.running.load(Ordering::SeqCst) {
+            match self.rx.try_recv() {
+
+                Ok(result) => {
+                    match result.mtype {
+
+                        MessageType::ClientResultCommit
+                            if result.txid == expected_txid =>
+                        {
+                            self.successful_ops += 1;
+                            return true;
+                        }
+
+                        MessageType::ClientResultAbort
+                            if result.txid == expected_txid =>
+                        {
+                            self.failed_ops += 1;
+                            return true;
+                        }
+
+                        MessageType::CoordinatorExit => {
+                            self.unknown_ops += 1;
+                            return false;
+                        }
+
+                        _ => {
+                            // Ignore unexpected messages.
+                        }
+                    }
+                }
+
+                Err(TryRecvError::Empty) => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+
+                Err(error) => {
+                    eprintln!("Failed to receive result: {:?}", error);
+                    self.unknown_ops += 1;
+                    return false;
+                }
+            }
+        }
+
+        // Interrupted before receiving a final result.
+        self.unknown_ops += 1;
+        false
     }
 
     ///
@@ -113,12 +207,7 @@ impl Client {
     /// requests made by this client before exiting.
     ///
     pub fn report_status(&mut self) {
-        // TODO: Collect actual stats
-        let successful_ops: u64 = 0;
-        let failed_ops: u64 = 0;
-        let unknown_ops: u64 = 0;
-
-        println!("{:16}:\tCommitted: {:6}\tAborted: {:6}\tUnknown: {:6}", self.id_str.clone(), successful_ops, failed_ops, unknown_ops);
+        println!("{:16}:\tCommitted: {:6}\tAborted: {:6}\tUnknown: {:6}", self.id_str.clone(), self.successful_ops, self.failed_ops, self.unknown_ops);
     }
 
     ///
@@ -130,8 +219,36 @@ impl Client {
     ///
     pub fn protocol(&mut self, n_requests: u32) {
 
-        // TODO
-        self.wait_for_exit_signal();
+        let mut wait_for_exit = true;
+
+        // Send the number of requests specified by the user.
+        for _ in 0..n_requests {
+
+            // Stop issuing requests if the simulation was interrupted.
+            if !self.running.load(Ordering::SeqCst) {
+                break;
+            }
+
+            // Send a transaction request.
+            if !self.send_next_operation() {
+                wait_for_exit = false;
+                break;
+            }
+
+            // Wait for the transaction's result.
+            if !self.recv_result() {
+                wait_for_exit = false;
+                break;
+            }
+        }
+
+        // Wait for the coordinator's shutdown message unless
+        // we already received it or lost the connection.
+        if wait_for_exit {
+            self.wait_for_exit_signal();
+        }
+
+        // Print transaction statistics.
         self.report_status();
     }
 }
