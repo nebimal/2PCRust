@@ -57,6 +57,11 @@ pub struct Coordinator {
     // Participant communication channels.
     participant_senders: HashMap<String, Sender<ProtocolMessage>>,
     participant_receivers: HashMap<String, Receiver<ProtocolMessage>>,
+
+    // Transaction statistics.
+    successful_ops: u64,
+    failed_ops: u64,
+    unknown_ops: u64,
 }
 
 ///
@@ -93,6 +98,10 @@ impl Coordinator {
 
             participant_senders: HashMap::new(),
             participant_receivers: HashMap::new(),
+
+            successful_ops: 0,
+            failed_ops: 0,
+            unknown_ops: 0,
         }
     }
 
@@ -136,12 +145,7 @@ impl Coordinator {
     /// requests made by this coordinator before exiting.
     ///
     pub fn report_status(&mut self) {
-        // TODO: Collect actual stats
-        let successful_ops: u64 = 0;
-        let failed_ops: u64 = 0;
-        let unknown_ops: u64 = 0;
-
-        println!("coordinator     :\tCommitted: {:6}\tAborted: {:6}\tUnknown: {:6}", successful_ops, failed_ops, unknown_ops);
+        println!("coordinator     :\tCommitted: {:6}\tAborted: {:6}\tUnknown: {:6}", self.successful_ops, self.failed_ops, self.unknown_ops);
     }
 
     ///
@@ -346,14 +350,20 @@ impl Coordinator {
                 MessageType::CoordinatorCommit => {
                     self.state = CoordinatorState::ReceivedVotesCommit;
                     status = RequestStatus::Committed;
+                    self.successful_ops += 1;
                 }
 
                 MessageType::CoordinatorAbort => {
                     self.state = CoordinatorState::ReceivedVotesAbort;
                     status = RequestStatus::Aborted;
+                    self.failed_ops += 1;
                 }
 
-                _ => unreachable!(),
+                _ => {
+                    status = RequestStatus::Unknown;
+                    self.unknown_ops += 1;
+                    unreachable!();
+                }
             }
             /**************************************************************
              *   5. Record the global decision in the coordinator's log   *
@@ -364,9 +374,100 @@ impl Coordinator {
                 "coordinator".to_string(),
                 request.opid,
             );
+            /*************************************************************************
+             *   6. Send CoordinatorCommit or CoordinatorAbort to ALL participants   *
+            *************************************************************************/
+
+            // Create a message containing the final decision.
+            let decision_message = ProtocolMessage::generate(
+                decision.clone(),
+                request.txid.clone(),
+                "coordinator".to_string(),
+                request.opid,
+            );
+
+            // Send the global decision to every participant.
+            for (participant_id, participant_send) in &self.participant_senders {
+                if let Err(error) = participant_send.send(decision_message.clone()) {
+                    eprintln!(
+                        "Failed to send decision to {}: {:?}",
+                        participant_id,
+                        error
+                    );
+                }
+            }
+            
+
+            /************************************************************************************************************************
+             *   7. Send ClientResultCommit or ClientResultAbort to the specific client that originally requested the transaction   *
+            ************************************************************************************************************************/
+            
+            // Find the original client's sender.
+            let client_send = self.client_senders.get(&client_id).unwrap();
+
+            // Determine which result to send.
+            let result_type = match self.state {
+                CoordinatorState::ReceivedVotesCommit => {
+                    MessageType::ClientResultCommit
+                }
+
+                CoordinatorState::ReceivedVotesAbort => {
+                    MessageType::ClientResultAbort
+                }
+
+                _ => unreachable!(),
+            };
+
+            // Construct the result message.
+            let result_message = ProtocolMessage::generate(
+                result_type,
+                request.txid.clone(),
+                "coordinator".to_string(),
+                request.opid,
+            );
+
+            // Send result to the requesting client.
+            client_send.send(result_message).unwrap();
+
+            // Update coordinator state.
+            self.state = CoordinatorState::SentGlobalDecision;
+
+            /********************************************************
+             *   8. Return to waiting for the next client request   *
+            ********************************************************/
+            // One transaction finished.
+            completed_requests += 1;
+
+            // Coordinator is ready to receive another request.
+            self.state = CoordinatorState::Quiescent;
 
         }
+        /************************************************************************************
+         *   9. When all requests have been processed or the simulation is shutting down,   * 
+         *   send CoordinatorExit messages and report the final statistics.                 *
+        ************************************************************************************/
+        
+        // Create a shutdown message.
+        let exit_message = ProtocolMessage::generate(
+            MessageType::CoordinatorExit,
+            "shutdown".to_string(),
+            "coordinator".to_string(),
+            0,
+        );
 
+        // Tell all clients to exit.
+        for (client_id, client_send) in &self.client_senders {
+            if let Err(error) = client_send.send(exit_message.clone()) {
+                eprintln!("Failed to notify {}: {:?}", client_id, error);
+            }
+        }
+
+        // Tell all participants to exit.
+        for (participant_id, participant_send) in &self.participant_senders {
+            if let Err(error) = participant_send.send(exit_message.clone()) {
+                eprintln!("Failed to notify {}: {:?}", participant_id, error);
+            }
+        }
 
         self.report_status();
     }

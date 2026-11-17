@@ -19,6 +19,7 @@ use client::ipc_channel::ipc::IpcSender as Sender;
 use message;
 use message::MessageType;
 use message::RequestStatus;
+use message::ProtocolMessage;
 
 // Client state and primitives for communicating with the coordinator
 #[derive(Debug)]
