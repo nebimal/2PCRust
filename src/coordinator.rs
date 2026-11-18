@@ -26,6 +26,9 @@ use message::RequestStatus;
 use oplog;
 use tpcoptions;
 
+/// How long the coordinator waits for all votes before aborting.
+const VOTE_TIMEOUT_MS: u64 = 1000;
+
 /// CoordinatorState
 /// States for 2PC state machine
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -209,6 +212,9 @@ impl Coordinator {
             // Stores the request and its originating client.
             let mut pending_request: Option<(String, ProtocolMessage)> = None;
 
+            // Clients whose channel has closed during this pass.
+            let mut gone: Vec<String> = Vec::new();
+
             for (client_id, client_recv) in &self.client_receivers {
 
                 match client_recv.try_recv() {
@@ -226,9 +232,22 @@ impl Coordinator {
                     }
 
                     Err(error) => {
-                        eprintln!("Error: {:?}", error);
+                        // The client's channel is closed; stop polling it.
+                        eprintln!("Client {} disconnected: {:?}", client_id, error);
+                        gone.push(client_id.clone());
                     }
                 }
+            }
+
+            // Forget disconnected clients so we never poll them again.
+            for id in gone {
+                self.client_receivers.remove(&id);
+                self.client_senders.remove(&id);
+            }
+
+            // With no clients left, no more requests can ever arrive.
+            if self.client_receivers.is_empty() {
+                break;
             }
 
             // If no request was received, skip to the next while iteration.
@@ -257,8 +276,12 @@ impl Coordinator {
             );
 
             // Send proposal to all participants.
-            for (_participant_id, participant_send) in &self.participant_senders {
-                participant_send.send(proposal.clone()).unwrap();
+            for (participant_id, participant_send) in &self.participant_senders {
+                if let Err(error) = participant_send.send(proposal.clone()) {
+                    // No vote can come from this participant, so the vote
+                    // count below will abort the transaction.
+                    eprintln!("Could not reach {}: {:?}", participant_id, error);
+                }
             }
             self.state = CoordinatorState::ProposalSent;
 
@@ -267,7 +290,7 @@ impl Coordinator {
              *   Remember to handle timeouts.                                                             *
             **********************************************************************************************/
             // Give the entire voting phase one second.
-            let deadline = Instant::now() + Duration::from_millis(1000);
+            let deadline = Instant::now() + Duration::from_millis(VOTE_TIMEOUT_MS);
 
             // Track which participants voted commit for this transaction.
             let mut commit_voters: HashSet<String> = HashSet::new();    
@@ -401,15 +424,15 @@ impl Coordinator {
             ************************************************************************************************************************/
             
             // Find the original client's sender.
-            let client_send = self.client_senders.get(&client_id).unwrap();
+            let client_send = self.client_senders.get(&client_id);
 
             // Determine which result to send.
-            let result_type = match self.state {
-                CoordinatorState::ReceivedVotesCommit => {
+            let result_type = match decision {
+                MessageType::CoordinatorCommit => {
                     MessageType::ClientResultCommit
                 }
 
-                CoordinatorState::ReceivedVotesAbort => {
+                MessageType::CoordinatorAbort => {
                     MessageType::ClientResultAbort
                 }
 
@@ -425,7 +448,16 @@ impl Coordinator {
             );
 
             // Send result to the requesting client.
-            client_send.send(result_message).unwrap();
+            match client_send {
+                Some(tx) => {
+                    if let Err(error) = tx.send(result_message) {
+                        eprintln!("Could not send result to {}: {:?}", client_id, error);
+                    }
+                }
+                None => {
+                    eprintln!("Client {} is no longer connected", client_id);
+                }
+            }
 
             // Update coordinator state.
             self.state = CoordinatorState::SentGlobalDecision;
