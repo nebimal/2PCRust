@@ -7,7 +7,8 @@ extern crate log;
 extern crate rand;
 extern crate stderrlog;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::process;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -49,6 +50,11 @@ pub struct Participant {
     send_success_prob: f64,
     operation_success_prob: f64,
 
+    // Recovery: chance of crashing right after voting, and whether this
+    // process is a restart that must rebuild its state from the log.
+    crash_prob: f64,
+    recovering: bool,
+
     // Communication with coordinator.
     tx: Sender<ProtocolMessage>,
     rx: Receiver<ProtocolMessage>,
@@ -73,13 +79,8 @@ impl Participant {
     /// new()
     ///
     /// Return a new participant, ready to run the 2PC protocol with the coordinator.
-    ///
-    /// HINT: You may want to pass some channels or other communication
-    ///       objects that enable coordinator->participant and participant->coordinator
-    ///       messaging to this constructor.
-    /// HINT: You may want to pass some global flags that indicate whether
-    ///       the protocol is still running to this constructor. There are other
-    ///       ways to communicate this, of course.
+    /// A recovering participant reopens its existing log instead of starting
+    /// a fresh one.
     ///
     pub fn new(
         id_str: String,
@@ -88,16 +89,27 @@ impl Participant {
         send_success_prob: f64,
         operation_success_prob: f64,
         tx: Sender<ProtocolMessage>,
-        rx: Receiver<ProtocolMessage>) -> Participant {
+        rx: Receiver<ProtocolMessage>,
+        crash_prob: f64,
+        recovering: bool) -> Participant {
+
+        let log = if recovering {
+            oplog::OpLog::from_file(log_path)
+        } else {
+            oplog::OpLog::new(log_path)
+        };
 
         Participant {
             id_str: id_str,
             state: ParticipantState::Quiescent,
-            log: oplog::OpLog::new(log_path),
+            log: log,
             running: r,
             send_success_prob: send_success_prob,
             operation_success_prob: operation_success_prob,
-            
+
+            crash_prob: crash_prob,
+            recovering: recovering,
+
             tx,
             rx,
 
@@ -112,8 +124,6 @@ impl Participant {
     /// Send a protocol message to the coordinator. This can fail depending on
     /// the success probability. For testing purposes, make sure to not specify
     /// the -S flag so the default value of 1 is used for failproof sending.
-    ///
-    /// HINT: You will need to implement the actual sending
     ///
     pub fn send(&mut self, pm: ProtocolMessage) {
         let x: f64 = random();
@@ -134,12 +144,6 @@ impl Participant {
     /// with some probability of success/failure determined by the
     /// command-line option success_probability.
     ///
-    /// HINT: The code provided here is not complete--it provides some
-    ///       tracing infrastructure and the probability logic.
-    ///       Your implementation need not preserve the method signature
-    ///       (it's ok to add parameters or return something other than
-    ///       bool if it's more convenient for your design).
-    ///
     pub fn perform_operation(&mut self, request_option: &Option<ProtocolMessage>) -> bool {
 
         trace!("{}::Performing operation", self.id_str.clone());
@@ -154,6 +158,23 @@ impl Participant {
     }
 
     ///
+    /// maybe_crash()
+    /// Simulates a crash with probability crash_prob. Called right after the
+    /// vote is logged and sent, which is when a participant is "in doubt":
+    /// it has promised to commit but doesn't know the outcome yet.
+    ///
+    fn maybe_crash(&self, txid: &Option<String>) {
+        if self.crash_prob <= 0.0 {
+            return;
+        }
+        let x: f64 = random();
+        if x < self.crash_prob {
+            eprintln!("{}::Simulated crash after voting on {:?}", self.id_str, txid);
+            process::exit(1);
+        }
+    }
+
+    ///
     /// report_status()
     /// Report the abort/commit/unknown status (aggregate) of all transaction
     /// requests made by this coordinator before exiting.
@@ -162,6 +183,146 @@ impl Participant {
         println!("{:16}:\tCommitted: {:6}\tAborted: {:6}\tUnknown: {:6}", self.id_str.clone(), self.successful_ops, self.failed_ops, self.unknown_ops);
     }
 
+    ///
+    /// recover()
+    /// Rebuilds state from the log after a restart.
+    ///
+    /// 1. Count the decisions already logged, so the final report covers
+    ///    the whole run and not just this process.
+    /// 2. Find transactions with a logged vote but no logged decision. These
+    ///    are in doubt. (One that voted abort could safely abort on its own,
+    ///    but asking the coordinator handles both cases the same way.)
+    /// 3. Ask the coordinator for each outcome and log the answer.
+    /// 4. Tell the coordinator recovery is finished.
+    ///
+    /// Recovery messages bypass the lossy send(), because -S simulates lost
+    /// votes, not a broken recovery handshake.
+    ///
+    /// Returns false if the run is shutting down and the protocol loop
+    /// should not start.
+    ///
+    pub fn recover(&mut self) -> bool {
+        eprintln!("{}::Recovering from log", self.id_str);
+
+        // Copy the entries out so the log lock isn't held while we work.
+        let entries: Vec<ProtocolMessage> = {
+            let log_arc = self.log.arc();
+            let log = log_arc.lock().unwrap();
+            let copied: Vec<ProtocolMessage> = log.values().cloned().collect();
+            copied
+        };
+
+        let mut votes: HashMap<String, ProtocolMessage> = HashMap::new();
+        let mut decided: HashSet<String> = HashSet::new();
+
+        for entry in entries {
+            match entry.mtype {
+                MessageType::ParticipantVoteCommit | MessageType::ParticipantVoteAbort => {
+                    votes.insert(entry.txid.clone(), entry);
+                }
+                MessageType::CoordinatorCommit => {
+                    self.successful_ops += 1;
+                    decided.insert(entry.txid.clone());
+                }
+                MessageType::CoordinatorAbort => {
+                    self.failed_ops += 1;
+                    decided.insert(entry.txid.clone());
+                }
+                _ => {}
+            }
+        }
+
+        let mut keep_running = true;
+
+        for (txid, vote) in votes {
+            if decided.contains(&txid) {
+                continue;
+            }
+
+            eprintln!("{}::In doubt about {} (voted {:?}), asking coordinator",
+                      self.id_str, txid, vote.mtype);
+
+            let query = ProtocolMessage::generate(
+                MessageType::ParticipantRecoveryQuery,
+                txid.clone(),
+                self.id_str.clone(),
+                vote.opid,
+            );
+            if let Err(error) = self.tx.send(query) {
+                eprintln!("{}::Recovery query failed: {:?}", self.id_str, error);
+                self.unknown_ops += 1;
+                continue;
+            }
+
+            match self.wait_for_decision(&txid) {
+                Some(decision) => {
+                    // Log the outcome before acting on it, like any decision.
+                    self.log.append(
+                        decision,
+                        txid.clone(),
+                        self.id_str.clone(),
+                        vote.opid,
+                    );
+                    if decision == MessageType::CoordinatorCommit {
+                        self.successful_ops += 1;
+                    } else {
+                        self.failed_ops += 1;
+                    }
+                }
+                None => {
+                    self.unknown_ops += 1;
+                    keep_running = false;
+                    break;
+                }
+            }
+        }
+
+        let rejoin = ProtocolMessage::generate(
+            MessageType::ParticipantRejoin,
+            String::new(),
+            self.id_str.clone(),
+            0,
+        );
+        if let Err(error) = self.tx.send(rejoin) {
+            eprintln!("{}::Rejoin failed: {:?}", self.id_str, error);
+            return false;
+        }
+
+        keep_running
+    }
+
+    ///
+    /// wait_for_decision()
+    /// Waits for the coordinator's answer to a recovery query.
+    /// Returns None if the run stops or the coordinator goes away first.
+    ///
+    fn wait_for_decision(&mut self, txid: &str) -> Option<MessageType> {
+        while self.running.load(Ordering::SeqCst) {
+            match self.rx.try_recv() {
+                Ok(message) => {
+                    if message.txid == txid
+                        && (message.mtype == MessageType::CoordinatorCommit
+                            || message.mtype == MessageType::CoordinatorAbort)
+                    {
+                        return Some(message.mtype);
+                    }
+                    if message.mtype == MessageType::CoordinatorExit {
+                        return None;
+                    }
+                }
+
+                Err(TryRecvError::Empty) => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+
+                Err(error) => {
+                    eprintln!("{}::Lost coordinator during recovery: {:?}", self.id_str, error);
+                    return None;
+                }
+            }
+        }
+        None
+    }
 
     ///
     /// protocol()
@@ -172,6 +333,12 @@ impl Participant {
 
     pub fn protocol(&mut self) {
         trace!("{}::Beginning protocol", self.id_str);
+
+        // A restarted participant settles its in-doubt transactions first.
+        if self.recovering && !self.recover() {
+            self.report_status();
+            return;
+        }
 
         // Track which transaction is awaiting a global decision.
         let mut current_txid: Option<String> = None;
@@ -225,6 +392,10 @@ impl Participant {
 
                             current_txid = Some(message.txid);
                             self.send(vote);
+
+                            // Crash injection: the vote is logged and sent,
+                            // but the decision hasn't arrived yet.
+                            self.maybe_crash(&current_txid);
 
                             self.state = ParticipantState::AwaitingGlobalDecision;
                         }

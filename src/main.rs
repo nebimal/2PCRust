@@ -153,6 +153,18 @@ fn run(opts: & tpcoptions::TPCOptions, running: Arc<AtomicBool>) {
     // Function in coordinator.rs handles this.
     let mut coordinator = coordinator::Coordinator::new(coord_log_path, &running);
 
+    // Recovery: let the coordinator restart a crashed participant. The new
+    // process gets the same options plus --recover, so it rebuilds its state
+    // from its log instead of starting a fresh one.
+    let respawn_opts = opts.clone();
+    coordinator.set_respawner(Box::new(move |num: u32| {
+        let mut child_opts = respawn_opts.clone();
+        child_opts.mode = "participant".to_string();
+        child_opts.num = num;
+        child_opts.recover = true;
+        spawn_child_and_connect(&mut child_opts)
+    }));
+
     // Store child process handles, which allows the parent process manage 
     // and keep track of a child process it created.
     let mut children: Vec<Child> = Vec::new();
@@ -231,6 +243,11 @@ fn run(opts: & tpcoptions::TPCOptions, running: Arc<AtomicBool>) {
     for mut child in children {
         child.wait().expect("Failed to wait for child process");
     }
+
+    // Wait for any participants the coordinator restarted during the run.
+    for mut child in coordinator.take_respawned() {
+        child.wait().expect("Failed to wait for restarted participant");
+    }
 }
 
 ///
@@ -295,7 +312,9 @@ fn run_participant(opts: & tpcoptions::TPCOptions, running: Arc<AtomicBool>) {
         opts.send_success_probability,
         opts.operation_success_probability,
         tx,
-        rx);
+        rx,
+        opts.crash_probability,
+        opts.recover);
 
     /******************************************
      *   3. Starts the participant protocol   *

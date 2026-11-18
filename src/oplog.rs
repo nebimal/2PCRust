@@ -80,6 +80,8 @@ impl OpLog {
         }
         let lck = Mutex::new(l);
         let arc = Arc::new(lck);
+        // A restarted process must not reuse uids that are already in its log.
+        message::seed_uids(seqno + 1);
         OpLog {
             seqno: seqno,
             log_arc: arc,

@@ -26,6 +26,8 @@ pub enum MessageType {
     ClientResultCommit,     // result (success/fail) communicated to client
     ClientResultAbort,      // result (success/fail) communicated to client
     CoordinatorExit,        // Coordinator telling client/participant about shut down
+    ParticipantRecoveryQuery, // Restarted participant asks for the outcome of an in-doubt transaction
+    ParticipantRejoin,      // Restarted participant has finished recovery and is ready
 }
 
 ///
@@ -43,6 +45,16 @@ pub enum RequestStatus {
 
 /// generator for unique ids of messages
 static COUNTER: AtomicU32 = AtomicU32::new(1);
+
+///
+/// seed_uids(min_next)
+/// Makes sure the next generated uid is at least min_next. A restarted
+/// process calls this (through OpLog::from_file) so its new log entries
+/// don't reuse uids from before the crash.
+///
+pub fn seed_uids(min_next: u32) {
+    COUNTER.fetch_max(min_next, Ordering::SeqCst);
+}
 
 ///
 /// ProtocolMessage

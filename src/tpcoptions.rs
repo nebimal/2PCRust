@@ -24,6 +24,8 @@ pub struct TPCOptions {
     pub mode: String,                         // One of "run", "client", "particpant", "check"
     pub log_path: String,                     // Directory for client, participant, and coordinator logs
     pub ipc_path: String,                     // Path to IPC socket for setting up communication with the coordinator
+    pub crash_probability: f64,               // Probability a participant crashes right after voting
+    pub recover: bool,                        // Start this participant in recovery mode (set by the coordinator)
     pub num: u32,                             // Participant / Client number for naming the log files
 }
 
@@ -46,6 +48,7 @@ impl TPCOptions {
         let default_log_path = "./logs/";
         let default_ipc_path = "none";
         let default_num = "0";
+        let default_crash_probability = "0.0";
 
         // Set-Up clap
         let matches = App::new("concurrency-2pc")
@@ -102,6 +105,16 @@ impl TPCOptions {
                     .required(false)
                     .takes_value(true)
                     .help("Participant / Client number for naming the log files. Ranges from 0 to num_clients - 1 or num_participants - 1"))
+            .arg(Arg::with_name("crash_probability")
+                    .short("f")
+                    .required(false)
+                    .takes_value(true)
+                    .help("Probability a participant crashes right after voting (it is restarted and recovers)"))
+            .arg(Arg::with_name("recover")
+                    .long("recover")
+                    .required(false)
+                    .takes_value(false)
+                    .help("Internal: start a participant in recovery mode"))
             .get_matches();
 
         // Parse CLI options and take default values if none given
@@ -115,6 +128,8 @@ impl TPCOptions {
         let log_path = matches.value_of("log_path").unwrap_or(default_log_path);
         let ipc_path = matches.value_of("ipc_path").unwrap_or(default_ipc_path);
         let num = matches.value_of("num").unwrap_or(default_num).parse::<u32>().unwrap();
+        let crash_probability = matches.value_of("crash_probability").unwrap_or(default_crash_probability).parse::<f64>().unwrap();
+        let recover = matches.is_present("recover");
 
         // IPC path is necessary for client / participant to communicate with the coordinator
         match mode.as_ref() {
@@ -144,6 +159,8 @@ impl TPCOptions {
             log_path: log_path.to_string(),
             ipc_path: ipc_path.to_string(),
             num: num,
+            crash_probability: crash_probability,
+            recover: recover,
         }
     }
 
@@ -153,7 +170,7 @@ impl TPCOptions {
     /// HINT: This can be useful for passing arguments to children processes
     ///       using the std::process::Command's args(..) function
     pub fn as_vec(&self) -> Vec<String> {
-        vec![
+        let mut args = vec![
             format!("-S{}", self.send_success_probability),
             format!("-s{}", self.operation_success_probability),
             format!("-c{}", self.num_clients),
@@ -164,6 +181,11 @@ impl TPCOptions {
             format!("-l{}", self.log_path),
             format!("--ipc_path={}", self.ipc_path),
             format!("--num={}", self.num),
-        ]
+        ];
+        args.push(format!("-f{}", self.crash_probability));
+        if self.recover {
+            args.push("--recover".to_string());
+        }
+        args
     }
 }
