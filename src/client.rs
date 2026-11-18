@@ -10,7 +10,6 @@ use std::thread;
 use std::time::Duration;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::collections::HashMap;
 
 use client::ipc_channel::ipc::IpcReceiver as Receiver;
 use client::ipc_channel::ipc::TryRecvError;
@@ -18,7 +17,6 @@ use client::ipc_channel::ipc::IpcSender as Sender;
 
 use message;
 use message::MessageType;
-use message::RequestStatus;
 use message::ProtocolMessage;
 
 // Client state and primitives for communicating with the coordinator

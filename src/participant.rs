@@ -21,7 +21,6 @@ use participant::ipc_channel::ipc::IpcSender as Sender;
 
 use message::MessageType;
 use message::ProtocolMessage;
-use message::RequestStatus;
 use oplog;
 
 ///
@@ -144,7 +143,7 @@ impl Participant {
     /// with some probability of success/failure determined by the
     /// command-line option success_probability.
     ///
-    pub fn perform_operation(&mut self, request_option: &Option<ProtocolMessage>) -> bool {
+    pub fn perform_operation(&mut self, _request_option: &Option<ProtocolMessage>) -> bool {
 
         trace!("{}::Performing operation", self.id_str.clone());
         let x: f64 = random();

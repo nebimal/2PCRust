@@ -156,6 +156,9 @@ fn run(opts: & tpcoptions::TPCOptions, running: Arc<AtomicBool>) {
     // Recovery: let the coordinator restart a crashed participant. The new
     // process gets the same options plus --recover, so it rebuilds its state
     // from its log instead of starting a fresh one.
+    // Coordinator failure: chance of a simulated crash at each crash point.
+    coordinator.set_crash_probability(opts.coordinator_crash_probability);
+
     let respawn_opts = opts.clone();
     coordinator.set_respawner(Box::new(move |num: u32| {
         let mut child_opts = respawn_opts.clone();

@@ -24,6 +24,7 @@ pub struct TPCOptions {
     pub mode: String,                         // One of "run", "client", "particpant", "check"
     pub log_path: String,                     // Directory for client, participant, and coordinator logs
     pub ipc_path: String,                     // Path to IPC socket for setting up communication with the coordinator
+    pub coordinator_crash_probability: f64,   // Probability of a simulated coordinator crash at each crash point
     pub crash_probability: f64,               // Probability a participant crashes right after voting
     pub recover: bool,                        // Start this participant in recovery mode (set by the coordinator)
     pub num: u32,                             // Participant / Client number for naming the log files
@@ -49,6 +50,7 @@ impl TPCOptions {
         let default_ipc_path = "none";
         let default_num = "0";
         let default_crash_probability = "0.0";
+        let default_coordinator_crash_probability = "0.0";
 
         // Set-Up clap
         let matches = App::new("concurrency-2pc")
@@ -110,6 +112,11 @@ impl TPCOptions {
                     .required(false)
                     .takes_value(true)
                     .help("Probability a participant crashes right after voting (it is restarted and recovers)"))
+            .arg(Arg::with_name("coordinator_crash_probability")
+                    .short("C")
+                    .required(false)
+                    .takes_value(true)
+                    .help("Probability the coordinator crashes at each crash point (it recovers from its log)"))
             .arg(Arg::with_name("recover")
                     .long("recover")
                     .required(false)
@@ -130,6 +137,7 @@ impl TPCOptions {
         let num = matches.value_of("num").unwrap_or(default_num).parse::<u32>().unwrap();
         let crash_probability = matches.value_of("crash_probability").unwrap_or(default_crash_probability).parse::<f64>().unwrap();
         let recover = matches.is_present("recover");
+        let coordinator_crash_probability = matches.value_of("coordinator_crash_probability").unwrap_or(default_coordinator_crash_probability).parse::<f64>().unwrap();
 
         // IPC path is necessary for client / participant to communicate with the coordinator
         match mode.as_ref() {
@@ -161,6 +169,7 @@ impl TPCOptions {
             num: num,
             crash_probability: crash_probability,
             recover: recover,
+            coordinator_crash_probability: coordinator_crash_probability,
         }
     }
 

@@ -9,7 +9,6 @@ extern crate ipc_channel;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -20,14 +19,11 @@ use std::mem;
 use coordinator::ipc_channel::ipc::IpcSender as Sender;
 use coordinator::ipc_channel::ipc::IpcReceiver as Receiver;
 use coordinator::ipc_channel::ipc::TryRecvError;
-use coordinator::ipc_channel::ipc::channel;
+use coordinator::rand::random;
 
-use message;
 use message::MessageType;
 use message::ProtocolMessage;
-use message::RequestStatus;
 use oplog;
-use tpcoptions;
 
 /// How long the coordinator waits for all votes before aborting.
 const VOTE_TIMEOUT_MS: u64 = 1000;
@@ -91,6 +87,11 @@ pub struct Coordinator {
     dead: HashSet<String>,
     respawner: Respawner,
     respawned: Vec<Child>,
+
+    // Coordinator failure: where the log lives (recovery reloads it from disk)
+    // and the chance of a simulated crash at each crash point.
+    log_path: String,
+    crash_prob: f64,
 }
 
 ///
@@ -119,7 +120,9 @@ impl Coordinator {
 
         Coordinator {
             state: CoordinatorState::Quiescent,
-            log: oplog::OpLog::new(log_path),
+            log: oplog::OpLog::new(log_path.clone()),
+            log_path: log_path,
+            crash_prob: 0.0,
             running: r.clone(),
             
             client_senders: HashMap::new(),
@@ -170,6 +173,156 @@ impl Coordinator {
         // Register's the channels endpoints.
         self.client_senders.insert(name.clone(), tx);
         self.client_receivers.insert(name.clone(), rx);
+    }
+
+    ///
+    /// set_crash_probability()
+    /// Chance of a simulated coordinator crash at each crash point.
+    ///
+    pub fn set_crash_probability(&mut self, p: f64) {
+        self.crash_prob = p;
+    }
+
+    ///
+    /// maybe_crash()
+    /// Returns true if the coordinator should simulate a crash at this point.
+    ///
+    fn maybe_crash(&self, point: &str) -> bool {
+        if self.crash_prob <= 0.0 {
+            return false;
+        }
+        let x: f64 = random();
+        if x < self.crash_prob {
+            eprintln!("coordinator::Simulated crash {}", point);
+            return true;
+        }
+        false
+    }
+
+    ///
+    /// recover_coordinator()
+    /// Simulates a coordinator restart. Everything in memory about the current
+    /// transaction is gone; the coordinator rebuilds its state from the log
+    /// on disk. (The IPC channels are kept, standing in for a restarted
+    /// coordinator reconnecting to the same clients and participants.)
+    ///
+    /// The coordinator runs one transaction at a time, so only the most
+    /// recently proposed transaction can be unfinished:
+    ///   - decision logged:     resend it (it may not have reached everyone)
+    ///   - no decision logged:  presumed abort -- log abort, then send it
+    /// Participants ignore a decision for a transaction they aren't waiting
+    /// on, so resending is safe.
+    ///
+    /// Returns the number of transactions finished so far, recomputed from
+    /// the log.
+    ///
+    fn recover_coordinator(&mut self) -> u32 {
+        eprintln!("coordinator::Recovering from log");
+        self.state = CoordinatorState::Quiescent;
+
+        // Reload the log from disk, as a restarted process would.
+        self.log = oplog::OpLog::from_file(self.log_path.clone());
+
+        let entries: Vec<ProtocolMessage> = {
+            let log_arc = self.log.arc();
+            let log = log_arc.lock().unwrap();
+            let copied: Vec<ProtocolMessage> = log.values().cloned().collect();
+            copied
+        };
+
+        // Rebuild statistics and find the last proposal.
+        self.successful_ops = 0;
+        self.failed_ops = 0;
+        let mut decisions: HashMap<String, MessageType> = HashMap::new();
+        let mut last_proposal: Option<ProtocolMessage> = None;
+
+        for entry in entries {
+            match entry.mtype {
+                MessageType::CoordinatorCommit => {
+                    self.successful_ops += 1;
+                    decisions.insert(entry.txid.clone(), entry.mtype);
+                }
+                MessageType::CoordinatorAbort => {
+                    self.failed_ops += 1;
+                    decisions.insert(entry.txid.clone(), entry.mtype);
+                }
+                MessageType::CoordinatorPropose => {
+                    let newer = match last_proposal {
+                        Some(ref p) => entry.uid > p.uid,
+                        None => true,
+                    };
+                    if newer {
+                        last_proposal = Some(entry);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(proposal) = last_proposal {
+            let decision = match decisions.get(&proposal.txid) {
+                Some(d) => *d,
+                None => {
+                    // Never decided, so nobody can have committed: presumed abort.
+                    // Log it before sending it, like any decision.
+                    self.log.append(
+                        MessageType::CoordinatorAbort,
+                        proposal.txid.clone(),
+                        "coordinator".to_string(),
+                        proposal.opid,
+                    );
+                    self.failed_ops += 1;
+                    MessageType::CoordinatorAbort
+                }
+            };
+
+            eprintln!("coordinator::Finishing {} after restart with {:?}",
+                      proposal.txid, decision);
+
+            // Resend the decision to every participant.
+            let decision_message = ProtocolMessage::generate(
+                decision,
+                proposal.txid.clone(),
+                "coordinator".to_string(),
+                proposal.opid,
+            );
+            let mut gone: Vec<String> = Vec::new();
+            for (participant_id, participant_send) in &self.participant_senders {
+                if let Err(error) = participant_send.send(decision_message.clone()) {
+                    eprintln!("Failed to send decision to {}: {:?}", participant_id, error);
+                    gone.push(participant_id.clone());
+                }
+            }
+            for id in gone {
+                self.dead.insert(id);
+            }
+
+            // The client never got its result before the crash. The proposal
+            // record's sender is the client that made the request.
+            let result_type = if decision == MessageType::CoordinatorCommit {
+                MessageType::ClientResultCommit
+            } else {
+                MessageType::ClientResultAbort
+            };
+            let result_message = ProtocolMessage::generate(
+                result_type,
+                proposal.txid.clone(),
+                "coordinator".to_string(),
+                proposal.opid,
+            );
+            match self.client_senders.get(&proposal.senderid) {
+                Some(tx) => {
+                    if let Err(error) = tx.send(result_message) {
+                        eprintln!("Could not send result to {}: {:?}", proposal.senderid, error);
+                    }
+                }
+                None => {
+                    eprintln!("Client {} is no longer connected", proposal.senderid);
+                }
+            }
+        }
+
+        (self.successful_ops + self.failed_ops) as u32
     }
 
     ///
@@ -470,6 +623,17 @@ impl Coordinator {
                 request.opid,
             );
 
+            // Log the proposal before sending it, so a restarted coordinator
+            // knows this transaction was in progress. The sender field records
+            // which client asked for it. (The checker only counts commit and
+            // abort records, so this extra record doesn't affect it.)
+            self.log.append(
+                MessageType::CoordinatorPropose,
+                request.txid.clone(),
+                client_id.clone(),
+                request.opid,
+            );
+
             // Participants found dead during this transaction.
             let mut newly_dead: Vec<String> = Vec::new();
 
@@ -566,6 +730,12 @@ impl Coordinator {
                 decision = MessageType::CoordinatorAbort;
             }
 
+            // Crash point 1: votes are in, but no decision is logged yet.
+            if self.maybe_crash("before logging the decision") {
+                completed_requests = self.recover_coordinator();
+                continue;
+            }
+
             // Update the coordinator's state.
             match decision {
                 MessageType::CoordinatorCommit => {
@@ -599,6 +769,12 @@ impl Coordinator {
              *   6. Send CoordinatorCommit or CoordinatorAbort to ALL participants   *
             *************************************************************************/
 
+            // Crash point 2: the decision is logged but nobody has heard it.
+            if self.maybe_crash("after logging the decision, before sending it") {
+                completed_requests = self.recover_coordinator();
+                continue;
+            }
+
             // Create a message containing the final decision.
             let decision_message = ProtocolMessage::generate(
                 decision.clone(),
@@ -608,7 +784,16 @@ impl Coordinator {
             );
 
             // Send the global decision to every participant.
+            let mut sent_count = 0;
+            let mut crashed = false;
             for (participant_id, participant_send) in &self.participant_senders {
+                // Crash point 3: some participants have the decision, others don't.
+                if sent_count == 1 && self.maybe_crash("after sending the decision to some participants") {
+                    crashed = true;
+                    break;
+                }
+                sent_count += 1;
+
                 if let Err(error) = participant_send.send(decision_message.clone()) {
                     eprintln!(
                         "Failed to send decision to {}: {:?}",
@@ -627,6 +812,11 @@ impl Coordinator {
             // Remember who failed so they are restarted before the next transaction.
             for id in newly_dead {
                 self.dead.insert(id);
+            }
+
+            if crashed {
+                completed_requests = self.recover_coordinator();
+                continue;
             }
 
             // Find the original client's sender.
